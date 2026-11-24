@@ -1,0 +1,154 @@
+package app.morphe.patches.google.gemini
+
+import app.morphe.patches.google.common.geminiClonePermissionSupport
+import app.morphe.patcher.patch.bytecodePatch
+import app.morphe.patcher.patch.replaceStrings
+import app.morphe.patcher.string
+import app.morphe.patches.google.common.HookId
+import app.morphe.patches.google.common.VersionHookRegistry
+
+/** PackageManager must be allowed to see the same clone targeted by the DEX patch. */
+private val geminiPackageVisibilityPatch = app.morphe.patcher.patch.resourcePatch {
+    execute {
+        VersionHookRegistry.requireProfile(packageMetadata)
+        document("AndroidManifest.xml").use { doc ->
+            val manifest = doc.documentElement
+            val androidNs = "http://schemas.android.com/apk/res/android"
+            val queries = (0 until manifest.childNodes.length)
+                .map { manifest.childNodes.item(it) }
+                .filterIsInstance<org.w3c.dom.Element>().singleOrNull { it.tagName == "queries" }
+                ?: doc.createElement("queries").also { manifest.appendChild(it) }
+            val target = "com.google.android.googlequicksearchbox.morphe"
+            val present = (0 until queries.childNodes.length)
+                .map { queries.childNodes.item(it) }.filterIsInstance<org.w3c.dom.Element>()
+                .any { it.tagName == "package" && it.getAttributeNS(androidNs, "name") == target }
+            if (!present) {
+                queries.appendChild(doc.createElement("package").also {
+                    it.setAttributeNS(androidNs, "android:name", target)
+                })
+            }
+        }
+    }
+}
+
+/**
+ * Gemini アプリが呼び出す Google アプリのパッケージ名をクローン版（.morphe）へ変更するパッチ
+ */
+val geminiTargetPackagePatch = bytecodePatch(
+    name = "Gemini Redirect to Cloned Google App",
+    description = "Gemini アプリからの連携先 Google アプリをクローン版（com.google.android.googlequicksearchbox.morphe）へリダイレクトします。",
+    default = true
+) {
+    compatibleWith(*VersionHookRegistry.compatibility("com.google.android.apps.bard"))
+    dependsOn(geminiPackageVisibilityPatch, geminiClonePermissionSupport)
+
+    execute {
+        VersionHookRegistry.requireProfile(packageMetadata)
+        val pkgName = packageMetadata.packageName
+        val verName = packageMetadata.versionName
+        println("[GeminiTargetPatch] Target App: $pkgName (Version: $verName)")
+
+        val targetPackage = "com.google.android.googlequicksearchbox"
+        val replacementPackage = "com.google.android.googlequicksearchbox.morphe"
+
+        val targetSpec = VersionHookRegistry.getTargetSpec(HookId.GEMINI_TARGET_REDIRECT, pkgName, verName)
+        val searchPackage = targetSpec.anchorStrings.single()
+
+        check(searchPackage == targetPackage) { "Unexpected Gemini target anchor: $searchPackage" }
+
+        // One indexed pass; only classes with a matching const-string become mutable.
+        val totalReplacements = replaceStrings(string(targetPackage) to replacementPackage)
+        check(totalReplacements == targetSpec.expectedMatches) { "Unexpected Gemini target count: $totalReplacements" }
+        VersionHookRegistry.logHook(
+            HookId.GEMINI_TARGET_REDIRECT,
+            "DEX-Wide",
+            "SUCCESS",
+            "Replaced $totalReplacements occurrences"
+        )
+    }
+}
+
+/**
+ * Gemini アプリ（com.google.android.apps.bard）の Split APK 制約を解除しスタンドアロン化するパッチ
+ */
+val geminiStandalonePatch = app.morphe.patcher.patch.resourcePatch(
+    name = "Gemini Standalone Support",
+    description = "Geminiのsplit APK制約を除去します。Gemini本体機能には別途クローン版Googleアプリが必要です。",
+    default = true
+) {
+    compatibleWith(*VersionHookRegistry.compatibility("com.google.android.apps.bard"))
+
+    execute {
+        VersionHookRegistry.requireProfile(packageMetadata)
+        val pkgName = packageMetadata.packageName
+        val verName = packageMetadata.versionName
+        println("[GeminiStandalonePatch] Target App: $pkgName (Version: $verName)")
+
+        // The density split owns the original error-screen logo. A base-only APK
+        // must still render genuine missing/outdated-Google errors without crashing.
+        VersionHookRegistry.requireProfile(packageMetadata).hooks[HookId.GEMINI_ERROR_LOGO_FALLBACK]?.let { spec ->
+            document("res/values/styles.xml").use { doc ->
+                val styles = doc.getElementsByTagName("style")
+                var changed = 0
+                for (i in 0 until styles.length) {
+                    val style = styles.item(i) as org.w3c.dom.Element
+                    if (style.getAttribute("name") != spec.value("style")) continue
+                    val items = style.getElementsByTagName("item")
+                    for (j in 0 until items.length) {
+                        val item = items.item(j) as org.w3c.dom.Element
+                        if (item.getAttribute("name") == spec.value("attribute")) {
+                            item.textContent = spec.value("fallback")
+                            changed++
+                        }
+                    }
+                }
+                check(changed == spec.expectedMatches) { "Unexpected Gemini error-logo count: $changed" }
+            }
+        }
+
+        document("AndroidManifest.xml").use { document ->
+            val manifestElement = document.documentElement
+            val androidNs = "http://schemas.android.com/apk/res/android"
+            manifestElement.removeAttributeNS(androidNs, "requiredSplitTypes")
+            manifestElement.removeAttributeNS(androidNs, "splitTypes")
+            manifestElement.removeAttribute("android:requiredSplitTypes")
+            manifestElement.removeAttribute("android:splitTypes")
+            manifestElement.removeAttribute("requiredSplitTypes")
+            manifestElement.removeAttribute("splitTypes")
+
+            val metaDataNodes = document.getElementsByTagName("meta-data")
+            val toRemove = mutableListOf<org.w3c.dom.Element>()
+            for (i in 0 until metaDataNodes.length) {
+                val node = metaDataNodes.item(i) as org.w3c.dom.Element
+                val name = node.getAttributeNS(androidNs, "name").ifEmpty { node.getAttribute("android:name") }
+                if (name == "com.android.vending.splits.required" || name == "com.android.vending.splits") {
+                    toRemove.add(node)
+                }
+            }
+            for (node in toRemove) {
+                node.parentNode?.removeChild(node)
+            }
+            VersionHookRegistry.logHook(HookId.SPLIT_RESTRICTION_REMOVAL, "Manifest", "SUCCESS", "Removed Gemini split restrictions")
+
+            // アプリ表示名を "Gemini (Morphe)" に変更
+            val appNode = document.getElementsByTagName("application").item(0) as? org.w3c.dom.Element
+            appNode?.setAttribute("android:label", "Gemini (Morphe)")
+
+            val activityNodes = document.getElementsByTagName("activity")
+            for (i in 0 until activityNodes.length) {
+                val act = activityNodes.item(i) as org.w3c.dom.Element
+                if (act.hasAttribute("android:label")) {
+                    act.setAttribute("android:label", "Gemini (Morphe)")
+                }
+            }
+            val aliasNodes = document.getElementsByTagName("activity-alias")
+            for (i in 0 until aliasNodes.length) {
+                val alias = aliasNodes.item(i) as org.w3c.dom.Element
+                if (alias.hasAttribute("android:label")) {
+                    alias.setAttribute("android:label", "Gemini (Morphe)")
+                }
+            }
+            VersionHookRegistry.logHook(HookId.APP_LABEL_UPDATE, "Manifest", "SUCCESS", "Updated Gemini labels to 'Gemini (Morphe)'")
+        }
+    }
+}
